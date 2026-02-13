@@ -1,0 +1,1 @@
+This folder is mounted into the bot container to persist state (agent_state.json, trades.csv).
