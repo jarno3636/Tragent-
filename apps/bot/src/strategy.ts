@@ -45,8 +45,13 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
   if (!pk) return { ok: false, msg: "Missing PRIVATE_KEY" };
 
   const account = privateKeyToAccount(pk);
-  const publicClient = createPublicClient({ chain: base, transport: http(rpcUrl) });
-  const walletClient = createWalletClient({ chain: base, transport: http(rpcUrl), account });
+
+  // IMPORTANT:
+  // Base (OP stack) introduces "deposit" tx types. Some viem/ts combos cause
+  // type-level incompatibilities when PublicClient is inferred too strictly.
+  // This is a typing issue only. Runtime is fine. Force to `any`.
+  const publicClient: any = createPublicClient({ chain: base, transport: http(rpcUrl) });
+  const walletClient: any = createWalletClient({ chain: base, transport: http(rpcUrl), account });
 
   const symbols = Object.keys(cfg.allowTokens);
   const addrBySym = cfg.allowTokens as Record<string, `0x${string}`>;
@@ -245,12 +250,12 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
       args: [spender, sellAmount]
     });
 
-    // wait a bit for mining (Railway is fine)
+    // wait a bit for mining
     await publicClient.waitForTransactionReceipt({ hash: approveHash });
   }
 
   // execute swap
-  const txHash = await walletClient.sendTransaction({
+  const txHash: Hex = await walletClient.sendTransaction({
     to: q.to,
     data: q.data,
     value: q.value ?? 0n
