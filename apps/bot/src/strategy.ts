@@ -1,21 +1,32 @@
-import { createPublicClient, createWalletClient, http, parseUnits, formatUnits } from "viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  formatUnits,
+  http,
+  parseUnits,
+  type Hex
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
-import { checkPolicy, type ProposedTrade, type RuntimeConfig } from "@agent/core";
-import { balanceOf, decimals } from "./erc20.js";
-import { quote0x } from "./zerox.js";
-import { appendTradeCsv, loadState, saveState } from "./storage.js";
 
-export type TickResult = {
+import { readConfig } from "./config.js";
+import { appendTradeCsv, loadState, saveState } from "./storage.js";
+import { balanceOf, decimals, allowance, ERC20_ABI } from "./erc20.js";
+import { quote0x } from "./zerox.js";
+import { checkPolicy, type ProposedTrade, type RuntimeConfig } from "./core.js";
+
+type TickResult = {
   ok: boolean;
   msg: string;
   snapshot?: any;
   proposed?: ProposedTrade | null;
+  txHash?: Hex;
 };
 
 function pickMostOffTarget(targets: Record<string, number>, actual: Record<string, number>) {
   let worstSym: string | null = null;
   let worstDelta = 0;
+
   for (const sym of Object.keys(targets)) {
     const d = (actual[sym] ?? 0) - targets[sym];
     if (Math.abs(d) > Math.abs(worstDelta)) {
@@ -29,6 +40,7 @@ function pickMostOffTarget(targets: Record<string, number>, actual: Record<strin
 export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
   const rpcUrl = process.env.RPC_URL;
   const pk = process.env.PRIVATE_KEY as `0x${string}` | undefined;
+
   if (!rpcUrl) return { ok: false, msg: "Missing RPC_URL" };
   if (!pk) return { ok: false, msg: "Missing PRIVATE_KEY" };
 
@@ -37,48 +49,64 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
   const walletClient = createWalletClient({ chain: base, transport: http(rpcUrl), account });
 
   const symbols = Object.keys(cfg.allowTokens);
-  // Ensure targets sum ~1
+  const addrBySym = cfg.allowTokens as Record<string, `0x${string}`>;
+
+  // sanity: targets sum ~1
   const targetSum = Object.values(cfg.targets).reduce((a, b) => a + b, 0);
   if (Math.abs(targetSum - 1) > 0.02) {
-    return { ok: false, msg: `Targets must sum to ~1. Current sum=${targetSum}` };
+    return { ok: false, msg: `Targets must sum to ~1 (got ${targetSum}).`, proposed: null };
   }
 
-  // Load balances + decimals
-  const addrBySym = cfg.allowTokens as Record<string, `0x${string}`>;
+  // decimals + balances
   const decBySym: Record<string, number> = {};
   const balBySym: Record<string, bigint> = {};
+
   for (const sym of symbols) {
     decBySym[sym] = await decimals(publicClient, addrBySym[sym]);
     balBySym[sym] = await balanceOf(publicClient, addrBySym[sym], account.address);
   }
 
-  // Price each token in USDC using 0x quotes (small sells)
+  // price in USDC via small 0x quotes
   const usdcSym = "USDC";
-  const usdcAddr = addrBySym[usdcSym];
-  const usdcDec = decBySym[usdcSym];
+  if (!addrBySym[usdcSym]) return { ok: false, msg: "USDC must be in allowTokens.", proposed: null };
+
+  const usdcAddr = addrBySym.USDC;
+  const usdcDec = decBySym.USDC;
 
   const priceUsd: Record<string, number> = { USDC: 1 };
+
   for (const sym of symbols) {
-    if (sym === usdcSym) continue;
-    const sellAddr = addrBySym[sym];
-    const sellDec = decBySym[sym];
-    // sell tiny amount: 0.01 WETH, 10 AERO, 100 DEGEN (heuristic)
+    if (sym === "USDC") continue;
+
+    // heuristic probe sizes
     let testSellHuman = 0.01;
     if (sym === "AERO") testSellHuman = 10;
     if (sym === "DEGEN") testSellHuman = 100;
+    if (sym === "WETH") testSellHuman = 0.01;
 
-    const sellAmt = parseUnits(String(testSellHuman), sellDec);
-    const q = await quote0x({ chainId: cfg.chainId, sellToken: sellAddr, buyToken: usdcAddr, sellAmount: sellAmt });
+    const sellAmt = parseUnits(String(testSellHuman), decBySym[sym]);
+
+    const q = await quote0x({
+      chainId: cfg.chainId,
+      sellToken: addrBySym[sym],
+      buyToken: usdcAddr,
+      sellAmount: sellAmt,
+      takerAddress: account.address,
+      slippageBps: 100 // probe doesn't need strict
+    });
+
     const buyUsdc = Number(formatUnits(q.buyAmount, usdcDec));
     const p = buyUsdc / testSellHuman;
-    if (!isFinite(p) || p <= 0) return { ok: false, msg: `Bad price for ${sym}` };
+
+    if (!isFinite(p) || p <= 0) return { ok: false, msg: `Bad price for ${sym}`, proposed: null };
     priceUsd[sym] = p;
   }
 
-  // Portfolio value + allocation
+  // portfolio values + alloc
   const balHuman: Record<string, number> = {};
   const valueUsd: Record<string, number> = {};
   let portfolioUsd = 0;
+
   for (const sym of symbols) {
     const b = Number(formatUnits(balBySym[sym], decBySym[sym]));
     balHuman[sym] = b;
@@ -86,68 +114,100 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
     valueUsd[sym] = v;
     portfolioUsd += v;
   }
+
   const alloc: Record<string, number> = {};
   for (const sym of symbols) alloc[sym] = portfolioUsd > 0 ? valueUsd[sym] / portfolioUsd : 0;
 
-  const snapshot = { address: account.address, balHuman, priceUsd, valueUsd, portfolioUsd, alloc, targets: cfg.targets };
+  const snapshot = {
+    address: account.address,
+    portfolioUsd,
+    balHuman,
+    priceUsd,
+    valueUsd,
+    alloc,
+    targets: cfg.targets,
+    paused: cfg.paused
+  };
 
-  // State + drawdown stop
+  // state + drawdown stop
   const state = loadState();
   if (state.startValueUsd == null) {
     state.startValueUsd = portfolioUsd;
     saveState(state);
   }
+
   if (state.startValueUsd && portfolioUsd < state.startValueUsd * (1 - cfg.drawdownStopPct)) {
-    return { ok: false, msg: `Drawdown stop triggered (>${cfg.drawdownStopPct*100}% down). Bot will not trade.`, snapshot };
+    return {
+      ok: false,
+      msg: `Drawdown stop triggered (>${cfg.drawdownStopPct * 100}% down). Trading disabled.`,
+      snapshot,
+      proposed: null
+    };
   }
 
-  // Find most off target
+  // choose worst drift
   const { sym: worstSym, delta: worstDelta } = pickMostOffTarget(cfg.targets, alloc);
-  if (!worstSym) return { ok: true, msg: "No targets defined.", snapshot, proposed: null };
+  if (!worstSym) return { ok: true, msg: "No targets.", snapshot, proposed: null };
 
   if (Math.abs(worstDelta) < cfg.band) {
     return { ok: true, msg: "Within band. No trade.", snapshot, proposed: null };
   }
 
-  // Decide: if delta positive => over-allocated => sell it into USDC
-  // if delta negative => under-allocated => buy it using USDC
+  // propose trade toward target
   const notionalUsd = cfg.maxTradeUsd;
+
   let proposed: ProposedTrade;
   if (worstDelta > 0) {
-    proposed = { sellSymbol: worstSym, buySymbol: "USDC", notionalUsd, reason: `${worstSym} overweight by ${(worstDelta*100).toFixed(1)}%` };
+    // overweight => sell into USDC
+    proposed = {
+      sellSymbol: worstSym,
+      buySymbol: "USDC",
+      notionalUsd,
+      reason: `${worstSym} overweight by ${(worstDelta * 100).toFixed(1)}%`
+    };
   } else {
-    proposed = { sellSymbol: "USDC", buySymbol: worstSym, notionalUsd, reason: `${worstSym} underweight by ${(-worstDelta*100).toFixed(1)}%` };
+    // underweight => buy with USDC
+    proposed = {
+      sellSymbol: "USDC",
+      buySymbol: worstSym,
+      notionalUsd,
+      reason: `${worstSym} underweight by ${(-worstDelta * 100).toFixed(1)}%`
+    };
   }
 
-  // Ensure we have enough balance for the sell side
+  // ensure balance exists to sell
   if (proposed.sellSymbol === "USDC") {
-    if (balHuman.USDC < cfg.minTradeUsd) return { ok: true, msg: "Not enough USDC to buy.", snapshot, proposed };
+    if (balHuman.USDC < cfg.minTradeUsd) {
+      return { ok: true, msg: "Not enough USDC to buy.", snapshot, proposed };
+    }
   } else {
     const p = priceUsd[proposed.sellSymbol] || 0;
     if (p <= 0) return { ok: false, msg: "Bad price for sell token", snapshot, proposed };
     const needed = proposed.notionalUsd / p;
-    if (balHuman[proposed.sellSymbol] < needed * 0.98) return { ok: true, msg: `Not enough ${proposed.sellSymbol} to sell.`, snapshot, proposed };
+    if (balHuman[proposed.sellSymbol] < needed * 0.98) {
+      return { ok: true, msg: `Not enough ${proposed.sellSymbol} to sell.`, snapshot, proposed };
+    }
   }
 
   const nowMs = Date.now();
   const pol = checkPolicy(cfg, state, proposed, nowMs);
   if (!pol.ok) return { ok: true, msg: `Trade blocked by policy: ${pol.why}`, snapshot, proposed };
 
-  // Build 0x swap tx
+  // compute sellAmount
   const sellAddr = addrBySym[proposed.sellSymbol];
   const buyAddr = addrBySym[proposed.buySymbol];
   const sellDec = decBySym[proposed.sellSymbol];
 
   let sellAmount: bigint;
   if (proposed.sellSymbol === "USDC") {
-    sellAmount = parseUnits(String(proposed.notionalUsd.toFixed(usdcDec)), usdcDec);
+    sellAmount = parseUnits(proposed.notionalUsd.toFixed(6), usdcDec);
   } else {
     const p = priceUsd[proposed.sellSymbol];
     const sellHuman = proposed.notionalUsd / p;
-    // 8 decimal clamp for safety
     sellAmount = parseUnits(sellHuman.toFixed(8), sellDec);
   }
 
+  // get real quote with strict slippage
   const q = await quote0x({
     chainId: cfg.chainId,
     sellToken: sellAddr,
@@ -157,26 +217,46 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
     slippageBps: cfg.maxSlippageBps
   });
 
-  // Basic sanity: ensure quote isn't wildly off
-  const estBuyUsd = proposed.buySymbol === "USDC"
-    ? Number(formatUnits(q.buyAmount, usdcDec))
-    : Number(formatUnits(q.buyAmount, decBySym[proposed.buySymbol])) * (priceUsd[proposed.buySymbol] ?? 0);
+  // sanity: ensure quote isn't terrible (>12% impact)
+  const buyUsd =
+    proposed.buySymbol === "USDC"
+      ? Number(formatUnits(q.buyAmount, usdcDec))
+      : Number(formatUnits(q.buyAmount, decBySym[proposed.buySymbol])) * (priceUsd[proposed.buySymbol] ?? 0);
 
-  if (estBuyUsd < proposed.notionalUsd * 0.90) {
-    return { ok: true, msg: "Quote too poor (likely low liquidity / high impact). Skipping.", snapshot, proposed };
+  if (buyUsd < proposed.notionalUsd * 0.88) {
+    return { ok: true, msg: "Quote too poor (likely impact). Skipping.", snapshot, proposed };
   }
 
+  // if paused, do not send
   if (cfg.paused) {
-    return { ok: true, msg: "PAUSED=true, not sending. (Dry run snapshot ready)", snapshot, proposed };
+    return { ok: true, msg: "PAUSED=true (dry run only).", snapshot, proposed };
   }
 
-  const hash = await walletClient.sendTransaction({
+  // ensure allowance for allowanceTarget (0x)
+  const spender = (q.allowanceTarget || q.to) as `0x${string}`;
+  const current = await allowance(publicClient, sellAddr, account.address, spender);
+
+  if (current < sellAmount) {
+    // approve EXACT sellAmount (no infinite approvals)
+    const approveHash = await walletClient.writeContract({
+      address: sellAddr,
+      abi: ERC20_ABI,
+      functionName: "approve",
+      args: [spender, sellAmount]
+    });
+
+    // wait a bit for mining (Railway is fine)
+    await publicClient.waitForTransactionReceipt({ hash: approveHash });
+  }
+
+  // execute swap
+  const txHash = await walletClient.sendTransaction({
     to: q.to,
     data: q.data,
     value: q.value ?? 0n
   });
 
-  // Update state + logs
+  // update state + logs
   state.lastTradeAtMs = nowMs;
   state.tradesToday += 1;
   state.notionalTodayUsd += proposed.notionalUsd;
@@ -184,13 +264,18 @@ export async function runTick(cfg: RuntimeConfig): Promise<TickResult> {
 
   appendTradeCsv({
     ts: new Date().toISOString(),
-    hash,
+    txHash,
     sellSymbol: proposed.sellSymbol,
     buySymbol: proposed.buySymbol,
     notionalUsd: proposed.notionalUsd,
-    estBuyUsd: Number(estBuyUsd.toFixed(4)),
+    estBuyUsd: Number(buyUsd.toFixed(4)),
     reason: proposed.reason
   });
 
-  return { ok: true, msg: `Trade sent: ${hash}`, snapshot, proposed };
+  return { ok: true, msg: `Trade sent: ${txHash}`, snapshot, proposed, txHash };
+}
+
+export async function dryRunTick(): Promise<TickResult> {
+  const cfg = readConfig();
+  return runTick({ ...cfg, paused: true });
 }
