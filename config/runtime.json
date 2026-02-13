@@ -1,7 +1,7 @@
 {
   "chainId": 8453,
   "paused": true,
-  "adminToken": "CHANGE_ME",
+  "adminToken": "JUSTWANTTOMAKEIT_HERE",
   "targets": {
     "USDC": 0.35,
     "WETH": 0.35,
